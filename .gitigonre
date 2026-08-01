@@ -1,0 +1,24 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# IDE
+.vscode/
+.idea/
+
+# 临时文件
+*.log
+*.tmp
+.DS_Store
+
+# 本地环境变量（可能包含敏感信息）
+.env
+.env.local
+
+# Docker 临时文件
+docker-compose.override.yml
+
+# K8s 临时文件
+*.swp
+*.swo
