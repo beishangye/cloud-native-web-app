@@ -50,14 +50,14 @@ cloud-native-web-app/
 cd app
 docker build -t my-web-app:v1.1 .
 ```
-
+![构建成功](docs/images/successful.png)
 ### 2. 推送到 ACR
 
 ```bash
 docker tag my-web-app:v1.1 crpi-6dyxb1942h81dqrf.cn-hangzhou.personal.cr.aliyuncs.com/devops-project777/web-app:v1.1
 docker push crpi-6dyxb1942h81dqrf.cn-hangzhou.personal.cr.aliyuncs.com/devops-project777/web-app:v1.1
 ```
-
+![](docs/images/tag-push.png)
 ### 3. 部署到 K8s
 
 ```bash
@@ -72,20 +72,19 @@ kubectl apply -f k8s/ingress.yaml
 minikube addons enable ingress
 curl http://$(minikube ip)
 ```
-
+![](docs/images/curl-test.png)
 ## 📊 性能测试
 
 ```bash
 ab -n 1000 -c 100 http://192.168.49.2:80/
 ```
-
 **测试结果：**
 ```
 Requests per second:    318.94 [#/sec] (mean)
 Time per request:       313.543 [ms] (mean)
 Failed requests:        0
 ```
-
+![压力测试](docs/images/press_test.png)
 ## 🤔 踩坑记录
 
 ### 1. 镜像拉取失败 (ImagePullBackOff)
