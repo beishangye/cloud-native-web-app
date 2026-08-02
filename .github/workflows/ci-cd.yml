@@ -1,49 +1,27 @@
-# ============================================================
-# 工作流名称（在 GitHub Actions 页面显示）
-# ============================================================
 name: CI/CD to Alibaba Cloud ACK
 
-# ============================================================
-# 触发条件
-# ============================================================
 on:
   push:
-    branches: [main]       # 推送到 main 分支时触发
-  workflow_dispatch:       # 允许手动触发（在 GitHub 页面点击按钮）
+    branches: [main]
+  workflow_dispatch:
 
-# ============================================================
-# 环境变量（全局可用）
-# ============================================================
 env:
   REGISTRY: crpi-6dyxb1942h81dqrf.cn-hangzhou.personal.cr.aliyuncs.com
   NAMESPACE: devops-project777
   IMAGE_NAME: web-app
   DOCKERFILE_PATH: ./app
 
-# ============================================================
-# 作业（Jobs）
-# ============================================================
 jobs:
-  # --------------------------------------------
-  # Job 1: 构建并部署
-  # --------------------------------------------
   build-and-deploy:
-    # 运行环境：Ubuntu 最新版
     runs-on: ubuntu-latest
 
-    # --------------------------------------------
-    # 执行步骤
-    # --------------------------------------------
     steps:
-      # ---------- 1. 检出代码 ----------
       - name: Checkout code
         uses: actions/checkout@v4
 
-      # ---------- 2. 设置 Docker Buildx ----------
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      # ---------- 3. 登录阿里云 ACR ----------
       - name: Login to ACR
         uses: docker/login-action@v3
         with:
@@ -51,7 +29,6 @@ jobs:
           username: ${{ secrets.ACR_USERNAME }}
           password: ${{ secrets.ACR_PASSWORD }}
 
-      # ---------- 4. 构建 Docker 镜像 ----------
       - name: Build Docker image
         run: |
           docker build \
@@ -60,36 +37,39 @@ jobs:
             -f ${{ env.DOCKERFILE_PATH }}/Dockerfile \
             ${{ env.DOCKERFILE_PATH }}
 
-      # ---------- 5. 推送镜像到 ACR ----------
       - name: Push Docker image
         run: |
           docker push ${{ env.REGISTRY }}/${{ env.NAMESPACE }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
           docker push ${{ env.REGISTRY }}/${{ env.NAMESPACE }}/${{ env.IMAGE_NAME }}:latest
 
-      # ---------- 6. 安装 kubectl ----------
       - name: Install kubectl
         uses: azure/setup-kubectl@v4
         with:
           version: 'v1.28.0'
 
-      # ---------- 7. 配置集群访问凭证 ----------
       - name: Configure kubeconfig
         run: |
           mkdir -p $HOME/.kube
           echo "${{ secrets.KUBECONFIG }}" > $HOME/.kube/config
           chmod 600 $HOME/.kube/config
 
-      # ---------- 8. 部署到 ACK 集群 ----------
+      # ============================================================
+      # ✅ 修复：先创建/更新资源，再更新镜像
+      # ============================================================
       - name: Deploy to ACK
         run: |
-          # 更新 Deployment 的镜像版本
+          # 1. 创建或更新 K8s 资源
+          kubectl apply -f k8s/deployment.yaml
+          kubectl apply -f k8s/service.yaml
+          kubectl apply -f k8s/ingress.yaml
+          
+          # 2. 更新镜像版本
           kubectl set image deployment/web-app \
             web-app=${{ env.REGISTRY }}/${{ env.NAMESPACE }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
           
-          # 等待部署完成（超时 5 分钟）
+          # 3. 等待部署完成
           kubectl rollout status deployment/web-app --timeout=5m
 
-      # ---------- 9. 验证部署结果 ----------
       - name: Verify deployment
         run: |
           echo "========== Pods =========="
