@@ -1,0 +1,50 @@
+# ================================================================
+# Docker 构建上下文忽略清单
+# 生效前提：本文件必须位于【构建上下文根目录】。
+# 本项目的 docker build 上下文是 ./app（见 ci-cd.yml 的 docker build -f ./app/Dockerfile ./app），
+# 所以这个文件放在 app/ 下，而不是仓库根目录。
+# 没有它时，Dockerfile 里的 COPY . . 会把下面这些一起打进最终镜像。
+# ================================================================
+
+# ---- 版本控制 ----
+# 最重要的一条：.git 里可能残留历史上误提交的密钥。
+# 即使后来删了文件，git history 仍然带着它，一旦打进镜像
+# 任何人 docker history / docker cp 出来就能翻到。
+.git
+.gitignore
+
+# ---- Python 缓存与构建产物 ----
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+
+# ---- 本地虚拟环境 ----
+# 致命项：如果本地 .venv 存在，COPY . . 会把本机装的依赖覆盖进镜像，
+# 导致“本地能跑、CI 上跑不起来”或反过来，环境完全不可复现。
+.venv/
+venv/
+env/
+
+# ---- 敏感文件 ----
+.env
+.env.*
+*.pem
+*.key
+
+# ---- 文档、测试、截图（运行期用不到）----
+docs/
+*.md
+tests/
+
+# ---- 编辑器与系统临时文件 ----
+.vscode/
+.idea/
+.DS_Store
+*.swp
+*.tmp
+*.log
+
+# 注意：requirements.txt 不能忽略，Dockerfile 第 40 行 COPY requirements.txt . 需要它
