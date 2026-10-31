@@ -4,6 +4,11 @@ on:
   push:
     branches: [main]
   workflow_dispatch:
+    inputs:
+      deploy:
+        description: '是否部署到 ACK（需集群已开机，否则手动触发时请留空）'
+        type: boolean
+        default: false
 
 # 最小权限原则：GITHUB_TOKEN 默认可能拥有写权限，这里显式收敛为只读
 permissions:
@@ -19,8 +24,35 @@ env:
   # 此前这里写死 v1.28.0，与集群相差 8 个 minor，属于不受支持的版本组合。
   KUBECTL_VERSION: v1.36.1
 
+# ================================================================
+# 为什么拆成两个 job（2026-10 补充）
+# ----------------------------------------------------------------
+# 关键事实：**构建与推送镜像不需要 K8s 集群**。
+#   - Docker build 跑在 GitHub 的 runner 上，用的是 GitHub 的机器
+#   - ACR 是阿里云托管的镜像仓库服务，只要账号有效就能推，和 ECS/ACK 是否开机无关
+#   需要"你的服务器"的只有最后一步 kubectl apply。
+#
+# 如果不拆：ACK 集群一关机（省钱的常规操作），每次 push main 都会在
+# "连接集群"这一步红掉，Actions 页面长期挂着一排❌ —— 对作品集是负分，
+# 而且真正的部署故障也会被淹没在这堆噪音里。
+#
+# 拆开之后：
+#   build-and-push  → 永远跑，永远绿（只要有 ACR 凭据）
+#   deploy          → 只在明确要求时跑
+# 开关有两个（满足其一即部署）：
+#   1. 仓库变量 DEPLOY_ENABLED = true
+#      设置路径：Settings → Secrets and variables → Actions → Variables → New
+#   2. 手动触发时勾选 Run workflow 的 deploy
+#
+# 这样既不掩盖真实故障（声明要部署之后，连不上集群就必须红），
+# 又不会在平时制造噪音。
+# ================================================================
+
 jobs:
-  build-and-deploy:
+  # ==============================================================
+  # Job 1：构建并推送镜像 —— 不依赖任何服务器，始终执行
+  # ==============================================================
+  build-and-push:
     runs-on: ubuntu-latest
 
     steps:
@@ -83,6 +115,28 @@ jobs:
         run: |
           docker push ${{ env.REGISTRY }}/${{ env.NAMESPACE }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
 
+      - name: Summary
+        run: |
+          echo "### 镜像已推送" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          echo "${{ env.REGISTRY }}/${{ env.NAMESPACE }}/${{ env.IMAGE_NAME }}:${{ github.sha }}" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+
+  # ==============================================================
+  # Job 2：部署到 ACK —— 只有显式开启时才执行
+  #   这一 job 内不做任何"失败降级"：既然声明了要部署，
+  #   连不上集群就必须红，否则等于把真故障藏起来。
+  # ==============================================================
+  deploy:
+    needs: build-and-push
+    if: vars.DEPLOY_ENABLED == 'true' || inputs.deploy == true
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
       - name: Install kubectl
         uses: azure/setup-kubectl@776406bce94f63e41d621b960d78ee25c8b76ede # v4
         with:
@@ -110,9 +164,8 @@ jobs:
       #   - 通过 env: 传参：环境变量走进程环境，不经过 shell 语法解析
       #   - 引用时加双引号，并用 printf '%s' 而不是 echo（echo 会解释转义符）
       #
-      # 权限建议（与本流水线无关，属配置侧）：
-      #   secrets.KUBECONFIG 绑定的 ServiceAccount 应只拥有目标 namespace 的
-      #   deploy 权限，绝不能是 cluster-admin。
+      # 权限建议（配置侧）：secrets.KUBECONFIG 绑定的 ServiceAccount 应只拥有
+      # 目标 namespace 的 deploy 权限，绝不能是 cluster-admin。
       # ============================================================
       - name: Configure kubeconfig
         env:
@@ -128,12 +181,24 @@ jobs:
       # 连通性与版本 skew 校验
       # ------------------------------------------------------------
       # 在 apply 之前先确认连得上集群，否则后面的失败日志会非常难读。
-      # 同时把 kubectl / apiserver 的版本差打出来，超出 ±1 minor 时给 warning。
+      # 集群没开机时这一步会明确报错（这是刻意的，不是 bug）：
+      # 走到了 deploy job 就说明用户已经声明"要部署"，此时连不上就是真故障。
       # ============================================================
       - name: Verify cluster connectivity and version skew
         run: |
           set -euo pipefail
           export KUBECONFIG="$HOME/.kube/config"
+
+          if ! kubectl cluster-info --request-timeout=15s; then
+            echo ""
+            echo "::error::无法连接 ACK 集群。常见原因："
+            echo "::error::  1) 集群已停机/缩容到 0 节点（省钱模式）—— 请先在控制台开机"
+            echo "::error::  2) 集群已被释放 —— kubeconfig 中的 apiserver 地址永久失效，需重建集群并更新 secret"
+            echo "::error::  3) 集群 API Server 白名单未放行 GitHub Actions 出口 IP"
+            echo "::error::只有构建镜像的需求时，请不要设置 DEPLOY_ENABLED，让本 job 跳过即可。"
+            exit 1
+          fi
+
           kubectl version -o json > /tmp/kube-version.json
           python3 - <<'PY'
           import json
@@ -157,7 +222,6 @@ jobs:
           else:
               print('version skew 在官方支持的 ±1 minor 范围内')
           PY
-          kubectl cluster-info
 
       # ============================================================
       # 部署（2026-10 重构：单次滚动更新 + 失败自动回滚）
