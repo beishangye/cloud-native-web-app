@@ -1,0 +1,38 @@
+# ⚠️ 2026-10 修复：本仓库此前把文件名写成了 `.gitigonre`（拼写错误），
+#    Git 只认 `.gitignore`，所以这份规则从未生效过，
+#   __pycache__ / .env / *.log 等文件被一路提交进了版本库。
+#   现已改回正确文件名。
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+
+# IDE
+.vscode/
+.idea/
+
+# 临时文件
+*.log
+*.tmp
+.DS_Store
+*.swp
+*.swo
+
+# 本地环境变量（可能包含敏感信息）
+.env
+.env.local
+
+# Docker 临时文件
+docker-compose.override.yml
+
+# CI/CD 渲染产物：ci-cd.yml 会把 k8s/deployment.yaml 的镜像替换成本次 SHA 后
+# 输出到这个目录再 apply，属于构建中间产物，不应入库
+.render/
+
+# 本地 kubeconfig 等凭证：一旦误落本地务必别提交
+kubeconfig*
+!kubeconfig*.example

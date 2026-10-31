@@ -6,12 +6,16 @@ metadata:
     app: web-app
 spec:
   replicas: 3
+  # 保留足够多的历史 revision，rollout undo 才有得选（默认只有 10）
+  revisionHistoryLimit: 10
   selector:
     matchLabels:
       app: web-app
   strategy:
     type: RollingUpdate
     rollingUpdate:
+      # 更新过程中始终保证 3 个可用副本，代价是节点必须有余量起第 4 个 Pod；
+      # 资源不足时新 Pod 会 Pending，发布卡住，需要靠监控发现。
       maxSurge: 1
       maxUnavailable: 0
   template:
@@ -19,16 +23,124 @@ spec:
       labels:
         app: web-app
     spec:
+      # ============================================================
+      # 优雅退出（2026-10 新增）
+      # ============================================================
+      # Pod 删除时序：
+      #   1. kubelet 发 SIGTERM 给容器 PID 1（gunicorn）
+      #   2. 同时 kube-proxy 开始把该 Pod 从 Endpoints 摘除
+      #   3. 但 Endpoints 变更传播到所有节点的 iptables/IPVS 规则需要时间（秒级）
+      # 如果不 sleep，第 2 步还没生效容器就退出了，
+      # 在这段窗口里被转发过来的请求会 connection refused。
+      # preStop 的 sleep 就是给这个传播留缓冲 —— 注意它是【阻塞】容器退出的，
+      # 这段时间 Pod 仍是 Terminating 但还能正常处理请求。
+      terminationGracePeriodSeconds: 45   # preStop 5s + gunicorn graceful 30s + 余量
       containers:
       - name: web-app
+        # ⚠️ 这里的 tag 只是【本地/手工部署的默认值】。
+        #   CI 流水线不会直接用这份文件 —— ci-cd.yml 会先把镜像渲染成
+        #   :${GITHUB_SHA} 再 apply，保证一次 push 只触发【一次】滚动更新。
+        #   如果保留 CI 直接 apply 本文件，会先把集群打回 :v1.0（第一次滚动更新），
+        #   再 set image 到新 sha（第二次滚动更新），中间存在版本回退窗口，
+        #   并且会造成 Git 声明与集群实际状态永久不一致（configuration drift）。
         image: crpi-6dyxb1942h81dqrf.cn-hangzhou.personal.cr.aliyuncs.com/devops-project777/web-app:v1.0
         ports:
         - containerPort: 5000
           protocol: TCP
+
+        # ============================================================
+        # 探针（2026-10 补回）
+        # ------------------------------------------------------------
+        # 此前这里一个探针都没有，原因见 README 踩坑记录：
+        #   livenessProbe 端口误写成 3000（容器实际监听 5000），导致容器被反复重启，
+        #   当时的处理方式是【把探针删掉】——这是用“屏蔽告警”代替“解决问题”，
+        #   属于本项目最严重的一处失误。正确做法是改端口，而不是删探针。
+        #
+        # 没有探针的两个后果：
+        #   ① 无 livenessProbe：进程死锁 / 线程池耗尽 / 假死时（进程还在、
+        #      端口还通，但请求全部 hang），kubelet 完全无感，永远不会重启，
+        #      这个坏 Pod 会一直挂在 Endpoints 里吃流量，直到用户投诉才发现。
+        #   ② 无 readinessProbe：kubelet 判断 Ready 的默认依据就是“容器 Running”，
+        #      于是容器一启动就立刻进 Endpoints 接流量（哪怕 gunicorn 还没 preload 完）；
+        #      滚动更新时旧 Pod 会被同步摘掉，新旧交接窗口内直接 502。
+        #
+        # 端点统一用 /healthz（见 app/app.py）：
+        #   独立的轻量端点，不查下游依赖 —— liveness 只证明“自己活着”，
+        #   把依赖检查放进 liveness 会把一次下游抖动放大成全量副本重启。
+        # ============================================================
+        startupProbe:
+          httpGet:
+            path: /healthz
+            port: 5000
+          periodSeconds: 2
+          # 30 × 2s = 最多给 60s 启动时间；startupProbe 成功前不会跑 liveness，
+          # 避免启动慢的应用刚起来就被 liveness 判定失败而杀掉。
+          failureThreshold: 30
+        livenessProbe:
+          httpGet:
+            path: /healthz
+            port: 5000
+          periodSeconds: 10
+          timeoutSeconds: 2
+          # 连续 3 次失败才重启，避免单次网络抖动误杀
+          failureThreshold: 3
+        readinessProbe:
+          httpGet:
+            path: /healthz
+            port: 5000
+          periodSeconds: 5
+          timeoutSeconds: 2
+          failureThreshold: 3
+
+        lifecycle:
+          preStop:
+            exec:
+              command: ["sh", "-c", "sleep 5"]
+
+        # ============================================================
+        # 资源配额（2026-10 调整）
+        # ============================================================
+        # QoS 判定：requests != limits → Burstable。
+        #   （想拿 Guaranteed 必须每一项 requests 全等于 limits）
+        # 内存超限  → cgroup OOMKill，容器被杀重启（kubectl describe 看 OOMKilled）
+        # CPU 超限  → 只会被 CFS throttle 挂起，永远不会被杀（CPU 是可压缩资源）
+        # 节点内存不足 → kubelet eviction，Burstable 先于 Guaranteed 被驱逐
+        #
+        # CPU limits 由 500m 上调到 1000m：
+        #   原来 limits.cpu=500m 配 gunicorn -w 4，4 个 worker 抢 0.5 核必然 throttle。
+        #   现在 Dockerfile 改成 --workers 2，按 workers = 2×CPU+1 的公式
+        #   与 1000m（= 1 核）配额对齐。
         resources:
           requests:
             cpu: 250m
             memory: 256Mi
           limits:
-            cpu: 500m
+            cpu: 1000m
             memory: 512Mi
+
+        # 与 Dockerfile 的 USER appuser 对齐，作为集群侧的兜底约束：
+        # 即使镜像换了 USER root，Admission 阶段也会被拦下。
+        securityContext:
+          runAsNonRoot: true
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop: ["ALL"]
+
+      # ============================================================
+      # 打散调度（2026-10 新增）
+      # ============================================================
+      # 没有这条时，3 个副本完全可能被调度到同一台 Worker 上，
+      # 那台机器一挂服务 100% 中断 —— replicas: 3 形同虚设。
+      #
+      # 这里【不用】podAntiAffinity 的 requiredDuringScheduling：
+      #   本集群只有 2 台 Worker 却要跑 3 个副本，硬反亲和会让第 3 个副本
+      #   永远 Pending。topologySpreadConstraints + maxSkew: 1 可以在节点数
+      #   少于副本数时仍然保证“尽量均匀”，且不会导致调度失败。
+      # whenUnsatisfiable: ScheduleAnyway = 柔性约束（资源不够时宁可堆叠也不 Pending）
+      topologySpreadConstraints:
+      - maxSkew: 1
+        topologyKey: kubernetes.io/hostname
+        whenUnsatisfiable: ScheduleAnyway
+        labelSelector:
+          matchLabels:
+            app: web-app
